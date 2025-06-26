@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torchvision
 import torchvision.transforms as transforms
-import pandas as pd
+import torchvision.transforms.functional as F
 
 from models.vae import SimpleConvVAE
 
@@ -40,21 +40,42 @@ def log_metrics(csv_file, metrics):
             writer.writeheader()
         writer.writerow(metrics)
 
+# TODO Move this into data loader file
 def load_dataset(name, transform, batch_size):
     if name.lower() == "cifar10":
         train_data = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
         val_data = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-        image_size = (3, 32, 32)
     elif name.lower() == "cifar100":
         train_data = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
         val_data = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
-        image_size = (3, 32, 32)
     else:
         raise ValueError(f"Unsupported dataset: {name}")
 
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=batch_size)
-    return train_loader, val_loader, image_size
+    return train_loader, val_loader
+
+# TODO - move this into data transform / loader file
+class ConditionalResize:
+    def __init__(self, target_size):
+        self.target_size = target_size
+
+    def __call__(self, img):
+        if img.size != (self.target_size[1], self.target_size[0]):  # PIL uses (W, H)
+            return F.resize(img, self.target_size)
+        return img
+
+class ConditionalGrayscale:
+    def __init__(self, enabled, output_channels=1):
+        self.enabled = enabled
+        self.output_channels = output_channels
+
+    def __call__(self, img):
+        if not self.enabled:
+            return img
+        if img.mode != 'L' and self.output_channels == 1:
+            return F.to_grayscale(img, num_output_channels=self.output_channels)
+        return img
 
 def train_vae(config_path, checkpoint_path=None):
     config = load_config(config_path)
@@ -66,6 +87,8 @@ def train_vae(config_path, checkpoint_path=None):
     lr = float(config["learning_rate"])
     weight_decay = float(config["weight_decay"])
     checkpoint_interval = config["checkpoint_interval"]
+    resize = config["resize"]
+    channels = 3 if config.get("color", True) else 1
 
     # Output directory: out/<timestamp>_<model_name>/
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -73,10 +96,17 @@ def train_vae(config_path, checkpoint_path=None):
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "metrics.csv")
 
+    # TODO - this should be part of the data loader!
     # Dataset
-    transform = transforms.ToTensor()
-    train_loader, val_loader, image_size = load_dataset(dataset_name, transform, batch_size)
+    transform = transforms.Compose([
+        ConditionalResize(resize),
+        ConditionalGrayscale(enabled=(channels == 1)),
+        transforms.ToTensor()
+    ])
+    train_loader, val_loader = load_dataset(dataset_name, transform, batch_size)
+    image_size = (channels, resize[0], resize[1])
 
+    # TODO - this should be taken care of in another function
     # Model selection
     if model_name == "simple_conv_vae":
         model = SimpleConvVAE(input_shape=image_size)
@@ -143,6 +173,8 @@ def train_vae(config_path, checkpoint_path=None):
         val_recon /= len(val_loader)
         val_kl /= len(val_loader)
         val_total /= len(val_loader)
+
+        print(f"Epoch {epoch+1} Summary: Train Loss = {train_total:.4f}, Val Loss = {val_total:.4f}")
 
         metrics = {
             "epoch": epoch + 1,

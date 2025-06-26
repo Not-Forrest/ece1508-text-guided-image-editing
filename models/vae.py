@@ -7,13 +7,14 @@ class SimpleConvVAE(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         c, h, w = input_shape
+        self.h, self.w = h, w
         self.flattened_size = 64 * (h // 4) * (w // 4)
 
         # Encoder
         self.encoder = nn.Sequential(
-            nn.Conv2d(c, 32, 4, 2, 1),  # out: 32 x H/2 x W/2
+            nn.Conv2d(c, 32, 4, 2, 1),  # -> 32 x H/2 x W/2
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1), # out: 64 x H/4 x W/4
+            nn.Conv2d(32, 64, 4, 2, 1), # -> 64 x H/4 x W/4
             nn.ReLU(),
             nn.Flatten()
         )
@@ -23,9 +24,9 @@ class SimpleConvVAE(nn.Module):
         # Decoder
         self.fc_decode = nn.Linear(latent_dim, self.flattened_size)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # out: 32 x H/2 x W/2
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # -> 32 x H/2 x W/2
             nn.ReLU(),
-            nn.ConvTranspose2d(32, c, 4, 2, 1),   # out: C x H x W
+            nn.ConvTranspose2d(32, c, 4, 2, 1),   # -> C x H x W
             nn.Sigmoid()
         )
 
@@ -40,8 +41,9 @@ class SimpleConvVAE(nn.Module):
 
     def decode(self, z):
         h = self.fc_decode(z)
-        size_hw = int((self.flattened_size // 64) ** 0.5)
-        h = h.view(-1, 64, size_hw, size_hw).contiguous()
+        size_h = self.h // 4
+        size_w = self.w // 4
+        h = h.view(-1, 64, size_h, size_w)
         return self.decoder(h)
 
     def forward(self, x):
