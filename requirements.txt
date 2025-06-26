@@ -3,3 +3,4 @@ datasets
 diffusers
 matplotlib
 torch
+torchvision
