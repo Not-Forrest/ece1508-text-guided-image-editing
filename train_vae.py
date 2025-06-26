@@ -89,6 +89,8 @@ def train_vae(config_path, checkpoint_path=None):
     checkpoint_interval = config["checkpoint_interval"]
     resize = config["resize"]
     channels = 3 if config.get("color", True) else 1
+    base_beta = float(config.get("beta", 1.0))
+    warmup_epochs = int(config.get("warmup_epochs", 0))
 
     # Output directory: out/<timestamp>_<model_name>/
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -131,16 +133,22 @@ def train_vae(config_path, checkpoint_path=None):
         if early_stop:
             break
 
+        # Compute beta ramp-up weight
+        beta = base_beta
+        if warmup_epochs > 0:
+            beta = base_beta * min(1.0, epoch / warmup_epochs)
+
         # Training
         model.train()
         train_recon, train_kl, train_total = 0, 0, 0
         for x, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
             x = x.to(device)
+            
             x_recon, mu, logvar = model(x)
 
             recon_loss = criterion(x_recon, x)
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-            total_loss = recon_loss + kl_loss
+            total_loss = recon_loss + beta * kl_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -160,11 +168,12 @@ def train_vae(config_path, checkpoint_path=None):
         with torch.no_grad():
             for x, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 x = x.to(device)
+                
                 x_recon, mu, logvar = model(x)
 
                 recon_loss = criterion(x_recon, x)
                 kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-                total_loss = recon_loss + kl_loss
+                total_loss = recon_loss + beta * kl_loss
 
                 val_recon += recon_loss.item()
                 val_kl += kl_loss.item()
