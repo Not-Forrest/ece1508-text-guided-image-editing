@@ -1,6 +1,9 @@
-Pillow
-datasets
-diffusers
-matplotlib
 torch
 torchvision
+pandas
+PyYAML
+tqdm
+matplotlib
+Pillow
+# For installing CLIP directly from the official repository
+git+https://github.com/openai/CLIP.git

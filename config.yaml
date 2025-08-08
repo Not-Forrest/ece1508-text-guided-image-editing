@@ -1,0 +1,16 @@
+# --- Directories ---
+# Assumes the dataset is in 'data/celeba_data/img_align_celeba'
+# relative to the project root.
+DATA_ROOT: "data/celeba"
+LOG_DIR: "outputs/logs/run_1"
+EDIT_OUTPUT_DIR: "outputs/edits"
+
+# --- Training Hyperparameters ---
+IMG_SIZE: 64
+BATCH_SIZE: 64
+NUM_WORKERS: 2
+NUM_EPOCHS: 50
+LATENT_DIM: 128
+LEARNING_RATE: 0.0005
+BETA1: 0.5
+VGG_LOSS_WEIGHT: 0.00003

@@ -1,215 +1,137 @@
-import os
-import csv
-import yaml
-import signal
-import argparse
-from datetime import datetime
-
 import torch
-from torch import nn, optim
+import torch.optim as optim
+import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+from torchvision.utils import save_image
+import os
+import yaml
 from tqdm import tqdm
-import torchvision
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as F
+import pandas as pd
 
-from models.vae import SimpleConvVAE
+from models.vae import Encoder, Decoder, VGGPerceptualLoss, weights_init
 
-# Early stopping signal
-early_stop = False
-def signal_handler(sig, frame):
-    global early_stop
-    early_stop = True
-    print("Early stopping triggered. Will finish this epoch.")
+def setup_directories(log_dir):
+    """Creates necessary directories for logging and saving models."""
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(os.path.join(log_dir, "reconstructions"), exist_ok=True)
 
-signal.signal(signal.SIGINT, signal_handler)
+def get_dataloader(config):
+    """Prepares and returns the CelebA dataloader."""
+    data_path = os.path.join(config['DATA_ROOT'], "img_align_celeba")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Dataset not found at {data_path}. Please place the CelebA dataset in the correct directory.")
 
-def load_config(yaml_path):
-    with open(yaml_path, 'r') as f:
-        return yaml.safe_load(f)
-
-def save_checkpoint(state, path):
-    torch.save(state, path)
-    print(f"Checkpoint saved to {path}")
-
-def log_metrics(csv_file, metrics):
-    file_exists = os.path.exists(csv_file)
-    with open(csv_file, mode='a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(metrics)
-
-# TODO Move this into data loader file
-def load_dataset(name, transform, batch_size):
-    if name.lower() == "cifar10":
-        train_data = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-        val_data = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-    elif name.lower() == "cifar100":
-        train_data = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
-        val_data = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
-    else:
-        raise ValueError(f"Unsupported dataset: {name}")
-
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=batch_size)
-    return train_loader, val_loader
-
-# TODO - move this into data transform / loader file
-class ConditionalResize:
-    def __init__(self, target_size):
-        self.target_size = target_size
-
-    def __call__(self, img):
-        if img.size != (self.target_size[1], self.target_size[0]):  # PIL uses (W, H)
-            return F.resize(img, self.target_size)
-        return img
-
-class ConditionalGrayscale:
-    def __init__(self, enabled, output_channels=1):
-        self.enabled = enabled
-        self.output_channels = output_channels
-
-    def __call__(self, img):
-        if not self.enabled:
-            return img
-        if img.mode != 'L' and self.output_channels == 1:
-            return F.to_grayscale(img, num_output_channels=self.output_channels)
-        return img
-
-def train_vae(config_path, checkpoint_path=None):
-    config = load_config(config_path)
-
-    model_name = config["model_name"]
-    dataset_name = config["dataset"]
-    batch_size = config["batch_size"]
-    num_epochs = config["num_epochs"]
-    lr = float(config["learning_rate"])
-    weight_decay = float(config["weight_decay"])
-    checkpoint_interval = config["checkpoint_interval"]
-    resize = config["resize"]
-    channels = 3 if config.get("color", True) else 1
-    base_beta = float(config.get("beta", 1.0))
-    warmup_epochs = int(config.get("warmup_epochs", 0))
-
-    # Output directory: out/<timestamp>_<model_name>/
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("out", f"{timestamp}_{model_name}")
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "metrics.csv")
-
-    # TODO - this should be part of the data loader!
-    # Dataset
     transform = transforms.Compose([
-        ConditionalResize(resize),
-        ConditionalGrayscale(enabled=(channels == 1)),
-        transforms.ToTensor()
+        transforms.Resize(config['IMG_SIZE']),
+        transforms.CenterCrop(config['IMG_SIZE']),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    train_loader, val_loader = load_dataset(dataset_name, transform, batch_size)
-    image_size = (channels, resize[0], resize[1])
+    dataset = ImageFolder(root=config['DATA_ROOT'], transform=transform)
+    return DataLoader(dataset=dataset, batch_size=config['BATCH_SIZE'], shuffle=True, num_workers=config['NUM_WORKERS'], pin_memory=True)
 
-    # TODO - this should be taken care of in another function
-    # Model selection
-    if model_name == "simple_conv_vae":
-        model = SimpleConvVAE(input_shape=image_size)
-    else:
-        raise ValueError(f"Unknown model name: {model_name}")
+def save_checkpoint(encoder, decoder, optimizer, epoch, path):
+    """Saves a training checkpoint."""
+    state = {'encoder_state_dict': encoder.state_dict(), 'decoder_state_dict': decoder.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'epoch': epoch}
+    torch.save(state, path)
+    print(f"Checkpoint saved at epoch {epoch}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
-
+def load_checkpoint(encoder, decoder, optimizer, path):
+    """Loads a training checkpoint."""
     start_epoch = 0
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint.get("epoch", 0)
-        print(f"Loaded checkpoint from {checkpoint_path}")
+    if os.path.exists(path):
+        print(f"Resuming from checkpoint: {path}")
+        checkpoint = torch.load(path)
+        encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming from epoch {start_epoch}")
+    return start_epoch
 
-    for epoch in range(start_epoch, num_epochs):
-        if early_stop:
-            break
+def log_to_csv(log_path, metrics):
+    """Logs metrics to a CSV file."""
+    df = pd.DataFrame([metrics])
+    header = not os.path.exists(log_path)
+    df.to_csv(log_path, mode='a', header=header, index=False)
 
-        # Compute beta ramp-up weight
-        beta = base_beta
-        if warmup_epochs > 0:
-            beta = base_beta * min(1.0, epoch / warmup_epochs)
+def save_validation_images(epoch, fixed_batch, encoder, decoder, log_dir, device):
+    """Saves a batch of reconstructed images for validation."""
+    with torch.no_grad():
+        fixed_batch = fixed_batch.to(device)
+        mu, _ = encoder(fixed_batch)
+        recon_images = decoder(mu).cpu()
+        comparison = torch.cat([fixed_batch[:8].cpu(), recon_images[:8].cpu()])
+        save_path = os.path.join(log_dir, "reconstructions", f"reconstruction_{epoch+1}.png")
+        save_image(comparison, save_path, nrow=8, normalize=True)
 
-        # Training
-        model.train()
-        train_recon, train_kl, train_total = 0, 0, 0
-        for x, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
-            x = x.to(device)
-            
-            x_recon, mu, logvar = model(x)
+def train(config):
+    """Main training loop for the VAE."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-            recon_loss = criterion(x_recon, x)
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-            total_loss = recon_loss + beta * kl_loss
+    log_dir = config['LOG_DIR']
+    setup_directories(log_dir)
+    dataloader = get_dataloader(config)
+
+    encoder = Encoder(config['LATENT_DIM']).to(device)
+    decoder = Decoder(config['LATENT_DIM']).to(device)
+    encoder.apply(weights_init)
+    decoder.apply(weights_init)
+
+    params = list(encoder.parameters()) + list(decoder.parameters())
+    optimizer = optim.Adam(params, lr=config['LEARNING_RATE'], betas=(config['BETA1'], 0.999))
+
+    vgg_loss_fn = VGGPerceptualLoss().to(device)
+    mse_loss_fn = nn.MSELoss(reduction='sum')
+    kl_div_fn = lambda mu, logvar: -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    checkpoint_path = os.path.join(log_dir, "checkpoint.pth")
+    start_epoch = load_checkpoint(encoder, decoder, optimizer, checkpoint_path)
+    fixed_validation_batch, _ = next(iter(dataloader))
+
+    print("Starting VAE Training...")
+    for epoch in range(start_epoch, config['NUM_EPOCHS']):
+        loop = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{config['NUM_EPOCHS']}]")
+        total_loss, total_mse, total_vgg, total_kld = 0, 0, 0, 0
+
+        for i, (images, _) in enumerate(loop):
+            images = images.to(device)
+            bs = images.size(0)
+            mu, logvar = encoder(images)
+            z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+            recon_images = decoder(z)
+
+            mse_loss = mse_loss_fn(recon_images, images) / bs
+            vgg_loss = vgg_loss_fn(recon_images, images) * config['VGG_LOSS_WEIGHT'] / bs
+            kld_loss = kl_div_fn(mu, logvar) / bs
+            loss = mse_loss + vgg_loss + kld_loss
 
             optimizer.zero_grad()
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
 
-            train_recon += recon_loss.item()
-            train_kl += kl_loss.item()
-            train_total += total_loss.item()
+            total_loss += loss.item()
+            total_mse += mse_loss.item()
+            total_vgg += vgg_loss.item()
+            total_kld += kld_loss.item()
+            loop.set_postfix(loss=loss.item())
 
-        train_recon /= len(train_loader)
-        train_kl /= len(train_loader)
-        train_total /= len(train_loader)
+        avg_loss = total_loss / len(dataloader)
+        avg_mse = total_mse / len(dataloader)
+        avg_vgg = total_vgg / len(dataloader)
+        avg_kld = total_kld / len(dataloader)
+        print(f"End of Epoch {epoch+1} -> Avg Loss: {avg_loss:.4f}, MSE: {avg_mse:.4f}, VGG: {avg_vgg:.4f}, KLD: {avg_kld:.4f}")
 
-        # Validation
-        model.eval()
-        val_recon, val_kl, val_total = 0, 0, 0
-        with torch.no_grad():
-            for x, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                x = x.to(device)
-                
-                x_recon, mu, logvar = model(x)
+        log_to_csv(os.path.join(log_dir, "training_log.csv"), {'epoch': epoch + 1, 'total_loss': avg_loss, 'mse_loss': avg_mse, 'vgg_loss': avg_vgg, 'kld_loss': avg_kld})
+        save_validation_images(epoch, fixed_validation_batch, encoder, decoder, log_dir, device)
+        save_checkpoint(encoder, decoder, optimizer, epoch, checkpoint_path)
 
-                recon_loss = criterion(x_recon, x)
-                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-                total_loss = recon_loss + beta * kl_loss
+    print("Training Finished!")
 
-                val_recon += recon_loss.item()
-                val_kl += kl_loss.item()
-                val_total += total_loss.item()
-
-        val_recon /= len(val_loader)
-        val_kl /= len(val_loader)
-        val_total /= len(val_loader)
-
-        print(f"Epoch {epoch+1} Summary: Train Loss = {train_total:.4f}, Val Loss = {val_total:.4f}")
-
-        metrics = {
-            "epoch": epoch + 1,
-            "train_recon_loss": train_recon,
-            "train_kl_loss": train_kl,
-            "train_total_loss": train_total,
-            "val_recon_loss": val_recon,
-            "val_kl_loss": val_kl,
-            "val_total_loss": val_total
-        }
-        log_metrics(csv_path, metrics)
-
-        # Checkpoint
-        if (epoch + 1) % checkpoint_interval == 0 or early_stop:
-            save_checkpoint({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict()
-            }, os.path.join(output_dir, f"{model_name}_epoch_{epoch+1}.pt"))
-
-    print("Training complete.")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/vae_default.yaml", help="Path to YAML config")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to optional checkpoint file")
-    args = parser.parse_args()
-
-    train_vae(args.config, args.checkpoint)
+if __name__ == '__main__':
+    with open("config.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    train(config)
