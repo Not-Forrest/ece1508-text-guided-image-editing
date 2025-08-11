@@ -8,6 +8,7 @@ __pycache__/
 *.csv
 out/
 data/
+outputs/
 
 # C extensions
 *.so

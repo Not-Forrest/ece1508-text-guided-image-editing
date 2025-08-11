@@ -72,7 +72,7 @@ def train(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    log_dir = config['LOG_DIR']
+    log_dir = config['TRAIN_LOG_DIR']
     setup_directories(log_dir)
     dataloader = get_dataloader(config)
 

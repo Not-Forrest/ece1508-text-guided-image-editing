@@ -2,8 +2,9 @@
 # Assumes the dataset is in 'data/celeba_data/img_align_celeba'
 # relative to the project root.
 DATA_ROOT: "data/celeba"
-LOG_DIR: "outputs/logs/run_1"
+TRAIN_LOG_DIR: "outputs/logs/run_1"
 EDIT_OUTPUT_DIR: "outputs/edits"
+EDIT_CHECKPOINT_PATH: "pretrained_checkpoint.pth" # Checkpoint for editing images
 
 # --- Training Hyperparameters ---
 IMG_SIZE: 64
